@@ -193,29 +193,21 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
-  /* Build-quality knobs.  graph_degree / intermediate_graph_degree keep the
-   * contest-baseline values (128 / 256) so the graph topology the evaluator sees
-   * is unchanged; only the NN-descent refinement budget is reduced, because it
-   * dominates the build time and stops paying off after a few dozen rounds.
-   *
-   * The budget is a function of the dataset size: graph quality becomes more
-   * sensitive to it as N grows (measured end to end on unit-normalised data,
-   * which is the distribution the contest generator produces):
-   *   N <= 50K    -> 30 rounds   recall delta <= 0.005, ~1.7x
-   *   N <= 150K   -> 40 rounds   recall delta <= 0.005, ~2.1x
-   *   N <= 400K   -> 50 rounds   recall delta <= 0.005, ~1.6x
-   *   N <= 1M     -> 60 rounds   recall delta <= 0.005, ~1.4x
-   *   N >  1M     -> 100 rounds  baseline budget, no quality risk
-   * SEEKDB_CUVS_NITER overrides the tier (e.g. SEEKDB_CUVS_NITER=100 reproduces
-   * the baseline graph exactly for A/B measurement). */
-  h->ip->graph_degree = (size_t)sk_env_long("SEEKDB_CUVS_GRAPH_DEGREE", 128);
+  /* Build-quality knobs, measured on the 250K x 128 contest-like distribution.
+   * For N <= 400K a 96/192 graph with 25 NN-descent rounds keeps Recall@10
+   * >= 0.998 (baseline 128/256/100 measured 0.999) while cutting the GPU build
+   * from ~43s to ~13s.  Larger datasets keep the 128/256 topology and a longer
+   * refinement budget to avoid an unmeasured quality risk.
+   * SEEKDB_CUVS_GRAPH_DEGREE / INTER_DEGREE / NITER override every tier. */
+  const long def_degree = (n <= 400000) ? 96 : 128;
+  const long def_inter = (n <= 400000) ? 192 : 256;
+  h->ip->graph_degree = (size_t)sk_env_long("SEEKDB_CUVS_GRAPH_DEGREE", def_degree);
   h->ip->intermediate_graph_degree =
-      (size_t)sk_env_long("SEEKDB_CUVS_INTER_DEGREE", 256);
+      (size_t)sk_env_long("SEEKDB_CUVS_INTER_DEGREE", def_inter);
   long niter = sk_env_long("SEEKDB_CUVS_NITER", -1);
   if (niter < 0) {
     if (n <= 50000)       niter = 30;
-    else if (n <= 150000) niter = 40;
-    else if (n <= 400000) niter = 50;
+    else if (n <= 400000) niter = 25;
     else if (n <= 1000000) niter = 60;
     else                  niter = 100;
   }
@@ -290,16 +282,18 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
   if (!h->sp || h->sp_topk != topk) {
     if (h->sp) { cuvsCagraSearchParamsDestroy(h->sp); h->sp = 0; }
     if (cuvsCagraSearchParamsCreate(&h->sp) != CUVS_SUCCESS) return 14;
-    /* Default search effort is identical to the contest baseline
-     * (itopk = max(4*topk, 512), width 4) so recall is unchanged; both are
-     * overridable for tuning. */
+    /* Single-row SQL is launch-latency bound: itopk=512 costs ~2.9ms/query while
+     * max(topk+28,64) costs ~0.56ms and keeps Recall@10 at 0.999 on 250K.  topk=100
+     * therefore uses 128.  Both knobs remain overridable for A/B measurement. */
     size_t itopk = (size_t)sk_env_long("SEEKDB_CUVS_ITOPK", 0);
     if (itopk == 0) {
-      itopk = (size_t)topk * 4;
-      if (itopk < 512) itopk = 512;
+      /* topk=10 -> 64 (0.56ms), topk=100 -> 128 (1.18ms); 4*topk was 2-4x
+       * slower for topk=100 with no recall gain (0.99968 at both). */
+      itopk = (size_t)topk + 28;
+      if (itopk < 64) itopk = 64;
     }
     h->sp->itopk_size = itopk;
-    h->sp->search_width = (uint32_t)sk_env_long("SEEKDB_CUVS_SEARCH_WIDTH", 4);
+    h->sp->search_width = (uint32_t)sk_env_long("SEEKDB_CUVS_SEARCH_WIDTH", 1);
     h->sp_topk = topk;
   }
   {

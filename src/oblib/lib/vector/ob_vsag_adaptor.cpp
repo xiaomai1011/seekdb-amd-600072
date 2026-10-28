@@ -20,6 +20,7 @@
 #include <map>
 #include <set>
 #include <mutex>
+#include <condition_variable>
 #include <vector>
 #include <memory>
 #include <limits>
@@ -196,7 +197,7 @@ static void ob_cuvs_erase(void *key) {
 struct ObCuvsJob {
   ObCuvsEntry *ent; const float *query; int64_t topk; int dim; size_t n;
   bool need_build; std::vector<unsigned> *off; std::vector<float> *dst;
-  int rc_; bool built_;
+  int rc_; bool built_; bool done_ = false;
 };
 // Runs on a dedicated large-stack pthread: cuVS CAGRA build/search overflow the
 // small (~1.5MB) OB worker-thread stack.
@@ -219,6 +220,72 @@ static void *ob_cuvs_job(void *arg) {
                                 j->off->data(), j->dst->data());
   }
   return nullptr;
+}
+
+// Persistent 32MB-stack worker for the single-query path. Creating a pthread per
+// query dominates SQL latency: pure CAGRA search is ~0.1ms, while
+// pthread_create(+32MB stack)+join is milliseconds. One detached worker reuses
+// the large stack for every search; g_ob_cuvs_mu already serializes callers.
+static std::mutex g_ob_cuvs_task_mu;
+static std::condition_variable g_ob_cuvs_task_cv;
+static ObCuvsJob *g_ob_cuvs_pending = nullptr;
+static bool g_ob_cuvs_worker_started = false;
+
+static void *ob_cuvs_worker_loop(void *) {
+  for (;;) {
+    ObCuvsJob *job = nullptr;
+    {
+      std::unique_lock<std::mutex> lk(g_ob_cuvs_task_mu);
+      g_ob_cuvs_task_cv.wait(lk, [] { return g_ob_cuvs_pending != nullptr; });
+      job = g_ob_cuvs_pending;
+      g_ob_cuvs_pending = nullptr;
+    }
+    ob_cuvs_job(job);
+    {
+      std::lock_guard<std::mutex> lk(g_ob_cuvs_task_mu);
+      job->done_ = true;
+    }
+    g_ob_cuvs_task_cv.notify_all();
+  }
+  return nullptr;
+}
+
+static void ob_cuvs_run_job(ObCuvsJob &job) {
+  bool started = false;
+  {
+    std::lock_guard<std::mutex> lk(g_ob_cuvs_task_mu);
+    if (!g_ob_cuvs_worker_started) {
+      pthread_t tid;
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+      if (pthread_create(&tid, &attr, ob_cuvs_worker_loop, nullptr) == 0) {
+        pthread_detach(tid);
+        g_ob_cuvs_worker_started = true;
+      }
+      pthread_attr_destroy(&attr);
+    }
+    started = g_ob_cuvs_worker_started;
+  }
+  if (!started) {
+    // Fallback: preserve the old one-shot behavior if the worker cannot start.
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+    if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) {
+      pthread_join(tid, nullptr);
+    }
+    pthread_attr_destroy(&attr);
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_ob_cuvs_task_mu);
+    g_ob_cuvs_pending = &job;
+  }
+  g_ob_cuvs_task_cv.notify_all();
+  std::unique_lock<std::mutex> lk(g_ob_cuvs_task_mu);
+  g_ob_cuvs_task_cv.wait(lk, [&job] { return job.done_; });
 }
 
 // [BATCH] Feed nq probe vectors to ONE cuVS call (nq>1). Same large-stack
@@ -276,17 +343,14 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   ObCuvsEntry *ent = it->second;
   // Lazily (re)build the GPU CAGRA index when there are enough points and either
   // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
-  // a 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
+  // a persistent 32MB-stack worker (cuVS overflows the OB worker stack otherwise).
   const size_t n = ent->buf_ids_.size();
   const bool need_build =
       (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
   std::vector<unsigned> off(topk);
   std::vector<float> dst(topk);
   ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
+  ob_cuvs_run_job(job);
   if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
   if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
   // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
